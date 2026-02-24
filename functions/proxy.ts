@@ -1,14 +1,5 @@
 const API_BASE_URL = "https://music-api.gdstudio.xyz/api.php";
 
-// 允许的音源域名（防 SSRF）
-const ALLOWED_HOSTS = [
-  /(^|\.)kuwo\.cn$/i,
-  /(^|\.)music\.163\.com$/i,
-  /(^|\.)qq\.com$/i,
-  /(^|\.)kugou\.com$/i,
-  /(^|\.)migu\.cn$/i,
-];
-
 // 允许透传的响应头
 const SAFE_RESPONSE_HEADERS = [
   "content-type",
@@ -21,7 +12,7 @@ const SAFE_RESPONSE_HEADERS = [
   "expires",
 ];
 
-// ====== 工具函数 ======
+// ===== 工具函数 =====
 
 function createCorsHeaders(init?: Headers): Headers {
   const headers = new Headers();
@@ -38,6 +29,7 @@ function createCorsHeaders(init?: Headers): Headers {
   headers.set("Access-Control-Allow-Methods", "GET,HEAD,OPTIONS");
   headers.set("Access-Control-Allow-Headers", "*");
 
+  // 默认缓存
   if (!headers.has("Cache-Control")) {
     headers.set("Cache-Control", "public, max-age=3600");
   }
@@ -52,21 +44,13 @@ function handleOptions(): Response {
   });
 }
 
-// 校验域名
-function isAllowedHost(host: string): boolean {
-  return ALLOWED_HOSTS.some((r) => r.test(host));
-}
+// ===== 更宽松 URL 校验（避免误杀） =====
 
-// URL 校验
 function normalizeUrl(raw: string): URL | null {
   try {
     const url = new URL(raw);
 
     if (!["http:", "https:"].includes(url.protocol)) {
-      return null;
-    }
-
-    if (!isAllowedHost(url.hostname)) {
       return null;
     }
 
@@ -76,40 +60,42 @@ function normalizeUrl(raw: string): URL | null {
   }
 }
 
-// 根据平台设置 Referer
+// ===== Referer 自动匹配（修复403） =====
+
 function getReferer(host: string): string {
-  if (host.includes("kuwo.cn")) return "https://www.kuwo.cn/";
-  if (host.includes("music.163.com")) return "https://music.163.com/";
-  if (host.includes("qq.com")) return "https://y.qq.com/";
-  if (host.includes("kugou.com")) return "https://www.kugou.com/";
-  if (host.includes("migu.cn")) return "https://music.migu.cn/";
+  if (/kuwo\.cn/.test(host)) return "https://www.kuwo.cn/";
+  if (/163\.com/.test(host)) return "https://music.163.com/";
+  if (/qq\.com/.test(host)) return "https://y.qq.com/";
+  if (/kugou\.com/.test(host)) return "https://www.kugou.com/";
+  if (/migu\.cn/.test(host)) return "https://music.migu.cn/";
   return "";
 }
 
-// ====== 音频代理 ======
+// ===== 音频代理 =====
 
 async function proxyAudio(target: string, request: Request): Promise<Response> {
-  if (target.length > 1000) {
+  if (!target || target.length > 2000) {
     return new Response("Invalid target", { status: 400 });
   }
 
   const url = normalizeUrl(target);
   if (!url) {
-    return new Response("Invalid target", { status: 400 });
+    return new Response("Bad URL", { status: 400 });
   }
 
   const headers: Record<string, string> = {
     "User-Agent":
       request.headers.get("User-Agent") ||
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+      "Mozilla/5.0",
   };
 
+  // 动态 Referer（关键）
   const referer = getReferer(url.hostname);
   if (referer) {
     headers["Referer"] = referer;
   }
 
-  // 支持 Range（关键）
+  // 支持 Range（拖动播放）
   const range = request.headers.get("Range");
   if (range) {
     headers["Range"] = range;
@@ -121,13 +107,9 @@ async function proxyAudio(target: string, request: Request): Promise<Response> {
     upstream = await fetch(url.toString(), {
       method: "GET",
       headers,
-      cf: {
-        cacheTtl: 3600,
-        cacheEverything: true,
-      },
     });
-  } catch {
-    return new Response("Upstream fetch failed", { status: 502 });
+  } catch (err) {
+    return new Response("Fetch failed", { status: 502 });
   }
 
   const resHeaders = createCorsHeaders(upstream.headers);
@@ -138,11 +120,12 @@ async function proxyAudio(target: string, request: Request): Promise<Response> {
   });
 }
 
-// ====== API 代理 ======
+// ===== API 代理（重点修复） =====
 
 async function proxyApi(url: URL, request: Request): Promise<Response> {
   const apiUrl = new URL(API_BASE_URL);
 
+  // 透传参数
   url.searchParams.forEach((value, key) => {
     if (key === "target" || key === "callback") return;
     apiUrl.searchParams.set(key, value);
@@ -160,36 +143,48 @@ async function proxyApi(url: URL, request: Request): Promise<Response> {
         "User-Agent":
           request.headers.get("User-Agent") ||
           "Mozilla/5.0",
-        Accept: "application/json",
-      },
-      cf: {
-        cacheTtl: 600,
-        cacheEverything: true,
+        Accept: "*/*", // 更宽松
       },
     });
   } catch {
-    return json({ error: "API request failed" }, 502);
+    return json({ error: "API fetch failed" }, 502);
   }
+
+  // ===== 关键修复：兼容非标准 JSON =====
+  const text = await upstream.text();
 
   let data: any;
 
   try {
-    data = await upstream.json();
+    data = JSON.parse(text);
   } catch {
-    return json({ error: "Invalid JSON from API" }, 502);
+    // 如果不是 JSON，直接返回原始数据（避免报错）
+    return new Response(text, {
+      status: upstream.status,
+      headers: createCorsHeaders(upstream.headers),
+    });
   }
 
-  // 自动代理 URL（关键功能）
-  if (url.searchParams.get("types") === "url" && data.url) {
-    data.raw_url = data.url;
-    data.url =
-      `${url.origin}/?target=` + encodeURIComponent(data.url);
+  // ===== 自动代理播放地址（兼容各种格式） =====
+  if (url.searchParams.get("types") === "url") {
+    let musicUrl =
+      data?.url ||
+      data?.data ||
+      data?.url_mp3 ||
+      data?.url_flac;
+
+    if (typeof musicUrl === "string" && musicUrl.startsWith("http")) {
+      data.raw_url = musicUrl;
+      data.url =
+        `${url.origin}/?target=` +
+        encodeURIComponent(musicUrl);
+    }
   }
 
   return json(data, upstream.status);
 }
 
-// ====== JSON 工具 ======
+// ===== JSON 输出 =====
 
 function json(data: any, status = 200): Response {
   return new Response(JSON.stringify(data), {
@@ -201,16 +196,7 @@ function json(data: any, status = 200): Response {
   });
 }
 
-// ====== 防滥用（可选） ======
-
-function checkAuth(url: URL): boolean {
-  // 可选：加 token
-  // return url.searchParams.get("token") === "your-secret";
-
-  return true;
-}
-
-// ====== 主入口 ======
+// ===== 主入口 =====
 
 export default {
   async fetch(request: Request): Promise<Response> {
@@ -224,11 +210,6 @@ export default {
     // 限制方法
     if (!["GET", "HEAD"].includes(request.method)) {
       return new Response("Method Not Allowed", { status: 405 });
-    }
-
-    // 防滥用
-    if (!checkAuth(url)) {
-      return new Response("Forbidden", { status: 403 });
     }
 
     // 音频代理
